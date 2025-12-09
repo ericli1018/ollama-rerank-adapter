@@ -1,0 +1,22 @@
+{
+  "name": "ollama-rerank-adapter",
+  "version": "1.0.0",
+  "description": "Ollama Rerank 适配器 - 为 Dify 提供 Rerank API",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "ollama",
+    "rerank",
+    "dify"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
