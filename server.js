@@ -180,6 +180,13 @@ app.post('/v1/rerank', async (req, res) => {
   app._router.handle(req, res);
 });
 
+app.post('/rerank', async (req, res) => {
+  // 转发到主 rerank 端点
+  req.url = '/api/rerank';
+  app._router.handle(req, res);
+});
+
+
 // 启动服务器
 app.listen(PORT, () => {
   console.log('='.repeat(60));
