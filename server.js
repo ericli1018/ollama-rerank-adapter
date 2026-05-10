@@ -17,34 +17,38 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── 核心評分函式 ─────────────────────────────────────────────────────────────
+
 async function scoreDocument(query, doc, model) {
   const truncatedDoc = doc.slice(0, MAX_DOC_CHARS);
 
-  const messages = [
-    {
-      role: 'system',
-      content: 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".',
-    },
-    {
-      role: 'user',
-      content: `<Instruct>: ${INSTRUCTION}\n<Query>: ${query}\n<Document>: ${truncatedDoc}`,
-    },
-    {
-      role: 'assistant',
-      content: '<think>\n\n</think>\n\n',
-    },
-  ];
+  // 官方格式：手動拼 raw prompt + suffix token
+  // 用 /api/generate + raw:true 確保 suffix <think>\n\n</think>\n\n 真正寫進去
+  const rawPrompt =
+    `<|im_start|>system\n` +
+    `Judge whether the Document meets the requirements based on the Query and the Instruct provided. ` +
+    `Note that the answer can only be "yes" or "no".<|im_end|>\n` +
+    `<|im_start|>user\n` +
+    `<Instruct>: ${INSTRUCTION}\n` +
+    `<Query>: ${query}\n` +
+    `<Document>: ${truncatedDoc}<|im_end|>\n` +
+    `<|im_start|>assistant\n` +
+    `<think>\n\n</think>\n\n`;  // 官方 suffix，強制跳過 thinking 直接輸出 yes/no
 
-  const response = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+  const response = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model,
-      messages,
-      max_tokens: 1,
-      temperature: 0,
+      prompt: rawPrompt,
+      raw: true,        // 不套用 chat template，完全用 rawPrompt
+      stream: false,
+      options: {
+        temperature: 0,
+        num_predict: 1, // 只生成一個 token
+      },
       logprobs: true,
-      top_logprobs: 5,
+      top_logprobs: 10, // 加大確保 yes/no 都能抓到
     }),
   });
 
@@ -55,35 +59,53 @@ async function scoreDocument(query, doc, model) {
 
   const data = await response.json();
 
-  const topLogprobs = data.choices?.[0]?.logprobs?.content?.[0]?.top_logprobs;
+  // ── 從 logprobs 計算 yes/no 機率 ──────────────────────────────────────────
+  // /api/generate 格式：data.logprobs[0].top_logprobs → [{token, logprob, bytes}]
+  const topLogprobs = data.logprobs?.[0]?.top_logprobs;
 
   if (Array.isArray(topLogprobs) && topLogprobs.length > 0) {
+    // yes 有 yes / Yes / YES 三種大小寫，都要抓，取 logprob 最大（最可能）的
     let yesLogprob = null;
     let noLogprob  = null;
 
     for (const entry of topLogprobs) {
       const token = entry.token.trim().toLowerCase();
-      if (token === 'yes' && yesLogprob === null) yesLogprob = entry.logprob;
-      if (token === 'no'  && noLogprob  === null) noLogprob  = entry.logprob;
+      if (token === 'yes') {
+        // 取所有 yes 變體裡 logprob 最高的（最小負數）
+        if (yesLogprob === null || entry.logprob > yesLogprob) {
+          yesLogprob = entry.logprob;
+        }
+      }
+      if (token === 'no') {
+        if (noLogprob === null || entry.logprob > noLogprob) {
+          noLogprob = entry.logprob;
+        }
+      }
     }
 
+    // softmax(yes, no)：兩個都找到才算精確分數
     if (yesLogprob !== null && noLogprob !== null) {
       const yesExp = Math.exp(yesLogprob);
       const noExp  = Math.exp(noLogprob);
       return yesExp / (yesExp + noExp);
     }
 
+    // 只找到 yes：模型非常確定相關，no 不在 top_logprobs 裡
     if (yesLogprob !== null) return Math.exp(yesLogprob);
 
+    // 只找到 no：模型非常確定不相關
     if (noLogprob !== null) return 1 - Math.exp(noLogprob);
   }
 
-  const text = data.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
-  console.warn(`  ⚠️  logprobs unavailable (Ollama >= 0.12.11 required), fallback: "${text.slice(0, 30)}"`);
-  if (text.includes('yes')) return 0.85;
-  if (text.includes('no'))  return 0.15;
+  // ── Fallback：logprobs 拿不到，看生成的文字 ──────────────────────────────
+  const text = (data.response || '').trim().toLowerCase();
+  console.warn(`  ⚠️  logprobs miss, generated: "${text.slice(0, 20)}"`);
+  if (text.startsWith('yes')) return 0.85;
+  if (text.startsWith('no'))  return 0.15;
   return 0.5;
 }
+
+// ─── Rerank 端點 ──────────────────────────────────────────────────────────────
 
 async function handleRerank(req, res) {
   try {
@@ -100,6 +122,7 @@ async function handleRerank(req, res) {
     console.log(`🔍 Query: ${query.slice(0, 80)}`);
     console.log(`📄 Documents: ${documents.length}, model: ${rerankModel}`);
 
+    // 提取文字（相容各種格式）
     const docTexts = documents.map(doc => {
       if (typeof doc === 'string')                         return doc;
       if (typeof doc.text === 'string')                   return doc.text;
@@ -107,6 +130,7 @@ async function handleRerank(req, res) {
       return JSON.stringify(doc);
     });
 
+    // Sequential 評分，避免並行請求壓垮 Ollama
     const scores = [];
     for (let i = 0; i < docTexts.length; i++) {
       try {
@@ -151,7 +175,7 @@ app.get('/health', (req, res) => res.json({
 
 app.get('/', (req, res) => res.json({
   service: 'Ollama Rerank Adapter',
-  version: '2.2.0',
+  version: '2.0.0',
   endpoints: { rerank: '/api/rerank', health: '/health' },
 }));
 
@@ -163,13 +187,12 @@ app.get('/api/models', (req, res) => res.json({
 
 app.listen(PORT, () => {
   console.log('='.repeat(60));
-  console.log('🚀 Ollama Rerank Adapter v2.2 Started');
+  console.log('🚀 Ollama Rerank Adapter v2.0 Started');
   console.log('='.repeat(60));
   console.log(`📍 Port:          ${PORT}`);
   console.log(`🔗 Rerank API:    http://localhost:${PORT}/api/rerank`);
   console.log(`🤖 Ollama URL:    ${OLLAMA_URL}`);
   console.log(`📦 Model:         ${DEFAULT_MODEL}`);
   console.log(`✂️  Max doc chars: ${MAX_DOC_CHARS}`);
-  console.log('⚠️  Need Ollama >= 0.12.11 to support logprobs');
   console.log('='.repeat(60));
 });
