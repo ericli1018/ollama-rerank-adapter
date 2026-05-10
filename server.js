@@ -2,203 +2,174 @@ import express from 'express';
 import cors from 'cors';
 
 const app = express();
-const PORT = process.env.PORT || 11435;
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-const DEFAULT_MODEL = process.env.OLLAMA_MODEL || 'dengcao/Qwen3-Reranker-8B:Q5_K_M';
+const PORT          = process.env.PORT              || 11435;
+const OLLAMA_URL    = process.env.OLLAMA_BASE_URL   || 'http://localhost:11434';
+const DEFAULT_MODEL = process.env.OLLAMA_MODEL      || 'dengcao/Qwen3-Reranker-8B:Q5_K_M';
+const MAX_DOC_CHARS = parseInt(process.env.MAX_DOC_CHARS || '500');
+const INSTRUCTION   = process.env.RERANK_INSTRUCTION ||
+  'Given a web search query, retrieve relevant passages that answer the query';
 
-// 启用 CORS
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
 
-// 请求日志中间件
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
-// 调用 Ollama Rerank 模型为文档打分
-async function scoreDocument(query, document, model) {
-  try {
-    // 构建 rerank 提示词
-    const prompt = `Query: ${query}\nDocument: ${document}\nRelevance score:`;
-    
-    const response = await fetch(`${OLLAMA_BASE_URL}/api/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: model,
-        prompt: prompt,
-        stream: false,
-        options: {
-          temperature: 0,
-          num_predict: 10,
-        }
-      }),
-    });
+async function scoreDocument(query, doc, model) {
+  const truncatedDoc = doc.slice(0, MAX_DOC_CHARS);
 
-    if (!response.ok) {
-      throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-    }
+  const messages = [
+    {
+      role: 'system',
+      content: 'Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".',
+    },
+    {
+      role: 'user',
+      content: `<Instruct>: ${INSTRUCTION}\n<Query>: ${query}\n<Document>: ${truncatedDoc}`,
+    },
+    {
+      role: 'assistant',
+      content: '<think>\n\n</think>\n\n',
+    },
+  ];
 
-    const data = await response.json();
-    const responseText = data.response.trim();
-    
-    // 尝试从响应中提取数字分数
-    const scoreMatch = responseText.match(/(\d+\.?\d*)/);
-    if (scoreMatch) {
-      const score = parseFloat(scoreMatch[1]);
-      // 归一化分数到 0-1 之间
-      return Math.min(Math.max(score / 10, 0), 1);
-    }
-    
-    // 如果无法提取分数，返回默认值
-    return 0.5;
-  } catch (error) {
-    console.error('Error scoring document with Ollama:', error);
-    throw error;
+  const response = await fetch(`${OLLAMA_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages,
+      max_tokens: 1,
+      temperature: 0,
+      logprobs: true,
+      top_logprobs: 5,
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    throw new Error(`Ollama API ${response.status}: ${err}`);
   }
+
+  const data = await response.json();
+
+  const topLogprobs = data.choices?.[0]?.logprobs?.content?.[0]?.top_logprobs;
+
+  if (Array.isArray(topLogprobs) && topLogprobs.length > 0) {
+    let yesLogprob = null;
+    let noLogprob  = null;
+
+    for (const entry of topLogprobs) {
+      const token = entry.token.trim().toLowerCase();
+      if (token === 'yes' && yesLogprob === null) yesLogprob = entry.logprob;
+      if (token === 'no'  && noLogprob  === null) noLogprob  = entry.logprob;
+    }
+
+    if (yesLogprob !== null && noLogprob !== null) {
+      const yesExp = Math.exp(yesLogprob);
+      const noExp  = Math.exp(noLogprob);
+      return yesExp / (yesExp + noExp);
+    }
+
+    if (yesLogprob !== null) return Math.exp(yesLogprob);
+
+    if (noLogprob !== null) return 1 - Math.exp(noLogprob);
+  }
+
+  const text = data.choices?.[0]?.message?.content?.trim().toLowerCase() || '';
+  console.warn(`  ⚠️  logprobs unavailable (Ollama >= 0.12.11 required), fallback: "${text.slice(0, 30)}"`);
+  if (text.includes('yes')) return 0.85;
+  if (text.includes('no'))  return 0.15;
+  return 0.5;
 }
 
-// Rerank API 端点
-app.post('/api/rerank', async (req, res) => {
+async function handleRerank(req, res) {
   try {
     const { query, documents, top_n, model } = req.body;
 
-    // 验证请求参数
     if (!query) {
       return res.status(400).json({ error: 'Missing required parameter: query' });
     }
-
-    if (!documents || !Array.isArray(documents) || documents.length === 0) {
+    if (!Array.isArray(documents) || documents.length === 0) {
       return res.status(400).json({ error: 'Missing or invalid parameter: documents' });
     }
 
     const rerankModel = model || DEFAULT_MODEL;
-    console.log(`Processing rerank request with model: ${rerankModel}`);
-    console.log(`Query: ${query}`);
-    console.log(`Documents count: ${documents.length}`);
-    console.log(`🔍 First document structure:`, JSON.stringify(documents[0], null, 2));
+    console.log(`🔍 Query: ${query.slice(0, 80)}`);
+    console.log(`📄 Documents: ${documents.length}, model: ${rerankModel}`);
 
-    // 使用 Ollama Rerank 模型为每个文档打分
-    const scoredDocuments = await Promise.all(
-      documents.map(async (doc, index) => {
-        // 提取文本内容进行评分
-        let docText;
-        
-        if (typeof doc === 'string') {
-          docText = doc;
-        } else if (typeof doc.text === 'string') {
-          docText = doc.text;
-        } else if (typeof doc.text === 'object' && doc.text.text) {
-          // 处理嵌套的 text 对象
-          docText = doc.text.text;
-        } else {
-          docText = JSON.stringify(doc);
-        }
-        
-        // 使用 rerank 模型为文档打分
-        const relevanceScore = await scoreDocument(query, docText, rerankModel);
-        
-        // 返回结果，Dify 期望扁平结构，不要 document 包装
-        return {
-          index,
-          relevance_score: relevanceScore,
-          text: docText  // 直接返回 text 字段，不包装在 document 里
-        };
-      })
-    );
+    const docTexts = documents.map(doc => {
+      if (typeof doc === 'string')                         return doc;
+      if (typeof doc.text === 'string')                   return doc.text;
+      if (typeof doc.text === 'object' && doc.text?.text) return doc.text.text;
+      return JSON.stringify(doc);
+    });
 
-    // 按相关性分数降序排序
-    scoredDocuments.sort((a, b) => b.relevance_score - a.relevance_score);
+    const scores = [];
+    for (let i = 0; i < docTexts.length; i++) {
+      try {
+        const score = await scoreDocument(query, docTexts[i], rerankModel);
+        scores.push({ index: i, relevance_score: score, text: docTexts[i] });
+        console.log(`  [${i + 1}/${docTexts.length}] score=${score.toFixed(4)}`);
+      } catch (err) {
+        console.error(`  ❌ doc[${i}] error: ${err.message}`);
+        scores.push({ index: i, relevance_score: 0, text: docTexts[i] });
+      }
+    }
 
-    // 如果指定了 top_n，只返回前 N 个结果
-    const results = top_n ? scoredDocuments.slice(0, top_n) : scoredDocuments;
+    scores.sort((a, b) => b.relevance_score - a.relevance_score);
+    const results = top_n ? scores.slice(0, top_n) : scores;
 
-    console.log(`Rerank completed. Top score: ${results[0]?.relevance_score.toFixed(4)}`);
+    console.log(`✅ Top score: ${results[0]?.relevance_score.toFixed(4)}`);
 
-    // 返回 Dify 期望的格式
     res.json({
       results,
       model: rerankModel,
-      usage: {
-        total_tokens: documents.length + 1 // query + documents
-      }
+      usage: { total_tokens: documents.length + 1 },
     });
-
   } catch (error) {
-    console.error('Error processing rerank request:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
+    console.error('❌ Rerank error:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
-});
+}
 
-// 健康检查端点
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok',
-    service: 'Ollama Rerank Adapter',
-    ollama_url: OLLAMA_BASE_URL,
-    default_model: DEFAULT_MODEL
-  });
-});
+// ─── 路由 ─────────────────────────────────────────────────────────────────────
 
-// 根路径 - Dify 可能用来验证连接
-app.get('/', (req, res) => {
-  res.json({
-    service: 'Ollama Rerank Adapter',
-    version: '1.0.0',
-    status: 'running',
-    endpoints: {
-      rerank: '/api/rerank',
-      health: '/health',
-      models: '/api/models'
-    }
-  });
-});
+app.post('/api/rerank', handleRerank);
+app.post('/v1/rerank',  handleRerank);
+app.post('/rerank',     handleRerank);
 
-// 模型列表端点 - Dify 可能需要这个
-app.get('/api/models', (req, res) => {
-  res.json({
-    models: [
-      {
-        id: DEFAULT_MODEL,
-        name: DEFAULT_MODEL,
-        type: 'rerank'
-      }
-    ]
-  });
-});
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  service: 'Ollama Rerank Adapter',
+  ollama_url: OLLAMA_URL,
+  default_model: DEFAULT_MODEL,
+  max_doc_chars: MAX_DOC_CHARS,
+}));
 
-// v1 版本的 rerank 端点（兼容 Cohere 格式）
-app.post('/v1/rerank', async (req, res) => {
-  // 转发到主 rerank 端点
-  req.url = '/api/rerank';
-  app._router.handle(req, res);
-});
+app.get('/', (req, res) => res.json({
+  service: 'Ollama Rerank Adapter',
+  version: '2.2.0',
+  endpoints: { rerank: '/api/rerank', health: '/health' },
+}));
 
-app.post('/rerank', async (req, res) => {
-  // 转发到主 rerank 端点
-  req.url = '/api/rerank';
-  app._router.handle(req, res);
-});
+app.get('/api/models', (req, res) => res.json({
+  models: [{ id: DEFAULT_MODEL, name: DEFAULT_MODEL, type: 'rerank' }],
+}));
 
+// ─── 啟動 ─────────────────────────────────────────────────────────────────────
 
-// 启动服务器
 app.listen(PORT, () => {
   console.log('='.repeat(60));
-  console.log('🚀 Ollama Rerank Adapter 已启动');
+  console.log('🚀 Ollama Rerank Adapter v2.2 Started');
   console.log('='.repeat(60));
-  console.log(`📍 监听地址: http://localhost:${PORT}`);
-  console.log(`🔗 Rerank API: http://localhost:${PORT}/api/rerank`);
-  console.log(`🔗 健康检查: http://localhost:${PORT}/health`);
-  console.log(`🤖 Ollama URL: ${OLLAMA_BASE_URL}`);
-  console.log(`📦 默认模型: ${DEFAULT_MODEL}`);
-  console.log('='.repeat(60));
-  console.log('💡 提示: 确保 Ollama 服务正在运行');
-  console.log('💡 使用环境变量 OLLAMA_BASE_URL 和 OLLAMA_MODEL 可自定义配置');
+  console.log(`📍 Port:          ${PORT}`);
+  console.log(`🔗 Rerank API:    http://localhost:${PORT}/api/rerank`);
+  console.log(`🤖 Ollama URL:    ${OLLAMA_URL}`);
+  console.log(`📦 Model:         ${DEFAULT_MODEL}`);
+  console.log(`✂️  Max doc chars: ${MAX_DOC_CHARS}`);
+  console.log('⚠️  Need Ollama >= 0.12.11 to support logprobs');
   console.log('='.repeat(60));
 });
